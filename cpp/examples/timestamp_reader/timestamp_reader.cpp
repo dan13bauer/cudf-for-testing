@@ -154,10 +154,14 @@ struct matrix_case {
   expected_outcome expected;
 };
 
-/// Run a single matrix test case. Returns true if the actual outcome matches expected.
-bool run_matrix_case(std::string const& filepath, matrix_case const& mc)
+/// Build parquet reader options with filter and timestamp_type for a matrix case.
+/// The tree and scalars must outlive the returned options.
+cudf::io::parquet_reader_options build_matrix_options(
+  std::string const& filepath,
+  matrix_case const& mc,
+  cudf::ast::tree& tree,
+  std::vector<std::unique_ptr<cudf::scalar>>& scalars)
 {
-  // Select the scalar ticks for the filter precision.
   int64_t lower = 0, upper = 0;
   switch (mc.filter_type) {
     case cudf::type_id::TIMESTAMP_MILLISECONDS: lower = kLowerMs; upper = kUpperMs; break;
@@ -165,9 +169,6 @@ bool run_matrix_case(std::string const& filepath, matrix_case const& mc)
     case cudf::type_id::TIMESTAMP_NANOSECONDS: lower = kLowerNs; upper = kUpperNs; break;
     default: break;
   }
-
-  cudf::ast::tree tree;
-  std::vector<std::unique_ptr<cudf::scalar>> scalars;
 
   cudf::ast::expression const* filter = nullptr;
   switch (mc.filter_type) {
@@ -180,7 +181,7 @@ bool run_matrix_case(std::string const& filepath, matrix_case const& mc)
     case cudf::type_id::TIMESTAMP_NANOSECONDS:
       filter = &build_range_filter<cudf::timestamp_ns>(0, lower, upper, tree, scalars);
       break;
-    default: return false;
+    default: break;
   }
 
   auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
@@ -191,15 +192,12 @@ bool run_matrix_case(std::string const& filepath, matrix_case const& mc)
     builder.timestamp_type(cudf::data_type{mc.timestamp_type});
   }
 
-  bool threw     = false;
-  int64_t rows   = -1;
-  try {
-    auto result = cudf::io::read_parquet(builder.build());
-    rows        = result.tbl->view().num_rows();
-  } catch (std::exception const&) {
-    threw = true;
-  }
+  return builder.build();
+}
 
+/// Classify the actual outcome and compare against expected.
+bool check_outcome(expected_outcome expected, bool threw, int64_t rows)
+{
   expected_outcome actual;
   if (threw) {
     actual = expected_outcome::THROWS;
@@ -208,15 +206,54 @@ bool run_matrix_case(std::string const& filepath, matrix_case const& mc)
   } else if (rows == 0) {
     actual = expected_outcome::ROWS_0;
   } else {
-    // unexpected row count
     std::cout << "  UNEXPECTED: " << rows << " rows\n";
     return false;
   }
 
-  bool ok = (actual == mc.expected);
+  bool ok = (actual == expected);
   std::cout << (ok ? "  PASS" : "  FAIL") << ": actual=" << outcome_name(actual)
-            << ", expected=" << outcome_name(mc.expected) << "\n";
+            << ", expected=" << outcome_name(expected) << "\n";
   return ok;
+}
+
+/// Run a matrix case with the standard reader.
+bool run_matrix_standard(std::string const& filepath, matrix_case const& mc)
+{
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  auto options = build_matrix_options(filepath, mc, tree, scalars);
+
+  bool threw   = false;
+  int64_t rows = -1;
+  try {
+    auto result = cudf::io::read_parquet(options);
+    rows        = result.tbl->view().num_rows();
+  } catch (std::exception const&) {
+    threw = true;
+  }
+  return check_outcome(mc.expected, threw, rows);
+}
+
+/// Run a matrix case with the chunked reader.
+bool run_matrix_chunked(std::string const& filepath, matrix_case const& mc)
+{
+  cudf::ast::tree tree;
+  std::vector<std::unique_ptr<cudf::scalar>> scalars;
+  auto options = build_matrix_options(filepath, mc, tree, scalars);
+
+  bool threw      = false;
+  int64_t rows    = 0;
+  try {
+    constexpr std::size_t kChunkReadLimit = 0;
+    cudf::io::chunked_parquet_reader reader(kChunkReadLimit, options);
+    while (reader.has_next()) {
+      auto chunk = reader.read_chunk();
+      rows += chunk.tbl->view().num_rows();
+    }
+  } catch (std::exception const&) {
+    threw = true;
+  }
+  return check_outcome(mc.expected, threw, rows);
 }
 
 /// Read without any filter, just with timestamp_type set, to verify conversion works.
@@ -554,24 +591,30 @@ int main(int argc, char const** argv)
     }
   };
 
-  std::cout << "=== Full 36-combination matrix ===\n\n";
-  for (int i = 0; i < static_cast<int>(matrix.size()); ++i) {
-    auto const& mc = matrix[i];
-    // Extract native precision from column name
-    auto native = mc.col_name.substr(3);  // "us", "ms", or "ns"
-    std::cout << "[" << (i + 1) << "] native=" << native
-              << " filter=" << ts_type_label(mc.filter_type)
-              << " timestamp_type=" << ts_type_label(mc.timestamp_type)
-              << " expect=" << outcome_name(mc.expected) << "\n";
-    if (run_matrix_case(filepath, mc)) {
-      ++passed;
-    } else {
-      ++failed;
+  auto run_matrix = [&](char const* reader_label,
+                        bool (*runner)(std::string const&, matrix_case const&)) {
+    std::cout << "=== " << reader_label << ": 36-combination matrix ===\n\n";
+    for (int i = 0; i < static_cast<int>(matrix.size()); ++i) {
+      auto const& mc = matrix[i];
+      auto native    = mc.col_name.substr(3);
+      std::cout << "[" << (i + 1) << "] native=" << native
+                << " filter=" << ts_type_label(mc.filter_type)
+                << " timestamp_type=" << ts_type_label(mc.timestamp_type)
+                << " expect=" << outcome_name(mc.expected) << "\n";
+      if (runner(filepath, mc)) {
+        ++passed;
+      } else {
+        ++failed;
+      }
     }
-  }
+    std::cout << "\n";
+  };
 
-  std::cout << "\n=== Matrix: " << passed << " passed, " << failed << " failed, "
-            << matrix.size() << " total ===\n";
+  run_matrix("Standard reader", run_matrix_standard);
+  run_matrix("Chunked reader", run_matrix_chunked);
+
+  std::cout << "=== Matrix total: " << passed << " passed, " << failed << " failed, "
+            << (matrix.size() * 2) << " total ===\n";
 
   return (v_failed + failed) > 0 ? 1 : 0;
 }
