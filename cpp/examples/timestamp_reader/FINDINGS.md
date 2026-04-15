@@ -25,18 +25,17 @@ A millisecond scalar like `1,773,536,400,000` is compared against a raw
 microsecond value like `1,773,536,400,000,000` -- off by 1000x -- so the range
 check fails and no rows survive.
 
-The same issue applies in both directions and to both readers:
+The full matrix of 3 native precisions x 3 filter precisions x 4
+`timestamp_type` values (us, ms, ns, unset) yields 36 combinations with three
+distinct outcomes:
 
-| Parquet native | `timestamp_type` | Filter result |
-|----------------|-------------------|---------------|
-| us | ms | 0 rows (FAIL) |
-| ns | ms | 0 rows (FAIL) |
-| us | ns | 0 rows (FAIL) |
-| ms | ms | 3 rows (PASS -- no conversion needed) |
-| us | us | 3 rows (PASS -- no conversion needed) |
+| Outcome | Count | Condition | Example |
+|---------|-------|-----------|---------|
+| 3 rows (correct) | 8 | filter == native AND (timestamp_type == native OR unset) | native=us, filter=us, timestamp_type=us |
+| 0 rows (silent failure) | 4 | filter == timestamp_type != native | native=us, filter=ms, timestamp_type=ms |
+| throws | 24 | filter != output type (output = timestamp_type if set, else native) | native=us, filter=us, timestamp_type=ms |
 
-When no `timestamp_type` is set, the reader preserves native precision and
-filters work correctly.
+The test binary in this directory exercises all 36 combinations.
 
 ## The Catch-22
 

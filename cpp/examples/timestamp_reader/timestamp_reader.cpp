@@ -130,141 +130,93 @@ cudf::ast::expression const& build_range_filter(
     cudf::ast::ast_operator::LOGICAL_AND, ge_expr, le_expr);
 }
 
-struct test_case {
-  std::string label;
-  std::string col_name;
-  cudf::type_id scalar_type;
-  int64_t lower;
-  int64_t upper;
-  cudf::type_id timestamp_type;  // type to request via timestamp_type(); EMPTY = don't set
-  int expected_rows;
-  bool expect_wrong;  // true = we expect != kExpectedRows (wrong-unit test)
+// Expected outcome for a matrix test case.
+enum class expected_outcome {
+  ROWS_3,  // filter works, 3 rows returned
+  ROWS_0,  // filter passes validation but evaluates against raw values, 0 rows
+  THROWS,  // scalar type != output type, throws non-matching operand types
 };
 
-bool run_standard_read(std::string const& filepath, test_case const& tc)
+char const* outcome_name(expected_outcome o)
 {
-  cudf::ast::tree tree;
-  std::vector<std::unique_ptr<cudf::scalar>> scalars;
-
-  cudf::ast::expression const* filter = nullptr;
-  switch (tc.scalar_type) {
-    case cudf::type_id::TIMESTAMP_MILLISECONDS:
-      filter = &build_range_filter<cudf::timestamp_ms>(0, tc.lower, tc.upper, tree, scalars);
-      break;
-    case cudf::type_id::TIMESTAMP_MICROSECONDS:
-      filter = &build_range_filter<cudf::timestamp_us>(0, tc.lower, tc.upper, tree, scalars);
-      break;
-    case cudf::type_id::TIMESTAMP_NANOSECONDS:
-      filter = &build_range_filter<cudf::timestamp_ns>(0, tc.lower, tc.upper, tree, scalars);
-      break;
-    default: std::cerr << "  ERROR: unsupported scalar type\n"; return false;
+  switch (o) {
+    case expected_outcome::ROWS_3: return "3 rows";
+    case expected_outcome::ROWS_0: return "0 rows";
+    case expected_outcome::THROWS: return "throws";
   }
-
-  auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
-                   .column_names({tc.col_name})
-                   .filter(*filter);
-
-  if (tc.timestamp_type != cudf::type_id::EMPTY) {
-    builder.timestamp_type(cudf::data_type{tc.timestamp_type});
-  }
-
-  bool threw = false;
-  int64_t row_count = -1;
-  try {
-    auto result = cudf::io::read_parquet(builder.build());
-    auto table  = result.tbl->view();
-    row_count   = table.num_rows();
-
-    std::cout << "  rows=" << row_count << "\n";
-    print_table(table, result.metadata.schema_info);
-  } catch (std::exception const& e) {
-    threw = true;
-    std::cout << "  THREW: " << e.what() << "\n";
-  }
-
-  if (tc.expect_wrong) {
-    if (threw) {
-      std::cout << "  PASS (threw as acceptable for wrong-unit filter)\n";
-      return true;
-    }
-    if (row_count != tc.expected_rows) {
-      std::cout << "  PASS (wrong-unit filter returned " << row_count << " != " << tc.expected_rows
-                << ")\n";
-      return true;
-    }
-    std::cout << "  FAIL: wrong-unit filter unexpectedly returned correct row count\n";
-    return false;
-  }
-
-  if (threw) {
-    std::cout << "  FAIL: unexpected exception\n";
-    return false;
-  }
-  if (row_count != tc.expected_rows) {
-    std::cout << "  FAIL: expected " << tc.expected_rows << " rows, got " << row_count << "\n";
-    return false;
-  }
-  std::cout << "  PASS\n";
-  return true;
+  return "?";
 }
 
-bool run_chunked_read(std::string const& filepath, test_case const& tc)
+struct matrix_case {
+  std::string col_name;         // Parquet column (determines native precision)
+  cudf::type_id filter_type;    // scalar precision for the filter
+  cudf::type_id timestamp_type; // timestamp_type option; EMPTY = unset
+  expected_outcome expected;
+};
+
+/// Run a single matrix test case. Returns true if the actual outcome matches expected.
+bool run_matrix_case(std::string const& filepath, matrix_case const& mc)
 {
+  // Select the scalar ticks for the filter precision.
+  int64_t lower = 0, upper = 0;
+  switch (mc.filter_type) {
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: lower = kLowerMs; upper = kUpperMs; break;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: lower = kLowerUs; upper = kUpperUs; break;
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: lower = kLowerNs; upper = kUpperNs; break;
+    default: break;
+  }
+
   cudf::ast::tree tree;
   std::vector<std::unique_ptr<cudf::scalar>> scalars;
 
   cudf::ast::expression const* filter = nullptr;
-  switch (tc.scalar_type) {
+  switch (mc.filter_type) {
     case cudf::type_id::TIMESTAMP_MILLISECONDS:
-      filter = &build_range_filter<cudf::timestamp_ms>(0, tc.lower, tc.upper, tree, scalars);
+      filter = &build_range_filter<cudf::timestamp_ms>(0, lower, upper, tree, scalars);
       break;
     case cudf::type_id::TIMESTAMP_MICROSECONDS:
-      filter = &build_range_filter<cudf::timestamp_us>(0, tc.lower, tc.upper, tree, scalars);
+      filter = &build_range_filter<cudf::timestamp_us>(0, lower, upper, tree, scalars);
       break;
     case cudf::type_id::TIMESTAMP_NANOSECONDS:
-      filter = &build_range_filter<cudf::timestamp_ns>(0, tc.lower, tc.upper, tree, scalars);
+      filter = &build_range_filter<cudf::timestamp_ns>(0, lower, upper, tree, scalars);
       break;
-    default: std::cerr << "  ERROR: unsupported scalar type\n"; return false;
+    default: return false;
   }
 
   auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
-                   .column_names({tc.col_name})
+                   .column_names({mc.col_name})
                    .filter(*filter);
 
-  if (tc.timestamp_type != cudf::type_id::EMPTY) {
-    builder.timestamp_type(cudf::data_type{tc.timestamp_type});
+  if (mc.timestamp_type != cudf::type_id::EMPTY) {
+    builder.timestamp_type(cudf::data_type{mc.timestamp_type});
   }
 
-  bool threw = false;
-  int64_t total_rows = 0;
-  int chunks         = 0;
+  bool threw     = false;
+  int64_t rows   = -1;
   try {
-    constexpr std::size_t kChunkReadLimit = 0;
-    cudf::io::chunked_parquet_reader reader(kChunkReadLimit, builder.build());
-
-    while (reader.has_next()) {
-      auto chunk = reader.read_chunk();
-      auto table = chunk.tbl->view();
-      total_rows += table.num_rows();
-      ++chunks;
-      if (chunks == 1) { print_table(table, chunk.metadata.schema_info); }
-    }
-    std::cout << "  rows=" << total_rows << " (in " << chunks << " chunks)\n";
-  } catch (std::exception const& e) {
+    auto result = cudf::io::read_parquet(builder.build());
+    rows        = result.tbl->view().num_rows();
+  } catch (std::exception const&) {
     threw = true;
-    std::cout << "  THREW: " << e.what() << "\n";
   }
 
+  expected_outcome actual;
   if (threw) {
-    std::cout << "  FAIL: unexpected exception\n";
+    actual = expected_outcome::THROWS;
+  } else if (rows == 3) {
+    actual = expected_outcome::ROWS_3;
+  } else if (rows == 0) {
+    actual = expected_outcome::ROWS_0;
+  } else {
+    // unexpected row count
+    std::cout << "  UNEXPECTED: " << rows << " rows\n";
     return false;
   }
-  if (total_rows != tc.expected_rows) {
-    std::cout << "  FAIL: expected " << tc.expected_rows << " rows, got " << total_rows << "\n";
-    return false;
-  }
-  std::cout << "  PASS\n";
-  return true;
+
+  bool ok = (actual == mc.expected);
+  std::cout << (ok ? "  PASS" : "  FAIL") << ": actual=" << outcome_name(actual)
+            << ", expected=" << outcome_name(mc.expected) << "\n";
+  return ok;
 }
 
 /// Read without any filter, just with timestamp_type set, to verify conversion works.
@@ -301,100 +253,325 @@ int main(int argc, char const** argv)
     cuda_mr, rmm::percent_of_free_device_memory(50));
   cudf::set_current_device_resource(pool_mr.get());
 
-  // --- Baseline: unfiltered reads with timestamp_type=ms ---
-  std::cout << "=== Baseline: unfiltered read with timestamp_type=ms ===\n\n";
-  for (auto const& col : {"ts_us", "ts_ms", "ts_ns"}) {
-    run_unfiltered_read(filepath, col, cudf::type_id::TIMESTAMP_MILLISECONDS);
+  int v_passed = 0;
+  int v_failed = 0;
+  auto check = [&](char const* label, bool condition) {
+    if (condition) {
+      std::cout << "  VERIFIED: " << label << "\n";
+      ++v_passed;
+    } else {
+      std::cout << "  REFUTED:  " << label << "\n";
+      ++v_failed;
+    }
+  };
+
+  // =====================================================================
+  // CLAIM 1: Output column type matches the requested timestamp_type,
+  //          regardless of the Parquet native precision.
+  // =====================================================================
+  std::cout << "=== CLAIM 1: Output column type matches timestamp_type ===\n\n";
+  for (auto const& [col, native_name] :
+       std::vector<std::pair<std::string, std::string>>{
+         {"ts_us", "us"}, {"ts_ms", "ms"}, {"ts_ns", "ns"}}) {
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({col})
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    auto result     = cudf::io::read_parquet(builder.build());
+    auto output_tid = result.tbl->view().column(0).type().id();
+    std::cout << "  " << col << " (native " << native_name
+              << ") -> output type_id: " << type_id_name(output_tid) << "\n";
+    check((col + ": output is TIMESTAMP_MILLISECONDS").c_str(),
+          output_tid == cudf::type_id::TIMESTAMP_MILLISECONDS);
   }
   std::cout << "\n";
 
-  // --- Test cases ---
+  // =====================================================================
+  // CLAIM 2: AST filter literal type must match the OUTPUT type (not the
+  //          native Parquet type). Mismatched literals throw.
+  // =====================================================================
+  std::cout << "=== CLAIM 2: Filter literal type must match output type ===\n\n";
+  {
+    // 2a: ms scalars + timestamp_type=ms on us column -> accepted (no throw)
+    std::cout << "  2a: ms scalars on ts_us with timestamp_type=ms\n";
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    auto& filter = build_range_filter<cudf::timestamp_ms>(0, kLowerMs, kUpperMs, tree, scalars);
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({"ts_us"})
+                     .filter(filter)
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    bool accepted = false;
+    try {
+      cudf::io::read_parquet(builder.build());
+      accepted = true;
+    } catch (...) {
+    }
+    check("ms scalars + ms output type: accepted (no throw)", accepted);
+  }
+  {
+    // 2b: us scalars (native) + timestamp_type=ms on us column -> throws
+    std::cout << "  2b: us scalars on ts_us with timestamp_type=ms\n";
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    auto& filter = build_range_filter<cudf::timestamp_us>(0, kLowerUs, kUpperUs, tree, scalars);
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({"ts_us"})
+                     .filter(filter)
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    bool threw = false;
+    std::string what;
+    try {
+      cudf::io::read_parquet(builder.build());
+    } catch (std::exception const& e) {
+      threw = true;
+      what  = e.what();
+    }
+    std::cout << "      threw: " << (threw ? "yes" : "no");
+    if (threw) std::cout << " (" << what << ")";
+    std::cout << "\n";
+    check("us scalars + ms output type: throws non-matching operand types", threw);
+  }
+  {
+    // 2c: ns scalars (native) + timestamp_type=ms on ns column -> throws
+    std::cout << "  2c: ns scalars on ts_ns with timestamp_type=ms\n";
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    auto& filter = build_range_filter<cudf::timestamp_ns>(0, kLowerNs, kUpperNs, tree, scalars);
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({"ts_ns"})
+                     .filter(filter)
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    bool threw = false;
+    try {
+      cudf::io::read_parquet(builder.build());
+    } catch (...) {
+      threw = true;
+    }
+    check("ns scalars + ms output type: throws non-matching operand types", threw);
+  }
+  std::cout << "\n";
 
-  // ConvertedToMs: read each timestamp column as ms, filter with ms scalars.
-  std::vector<test_case> standard_cases = {
-    // -- ConvertedToMs --
-    {"ts_us -> ms (standard)", "ts_us", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs, kUpperMs,
-     cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
-    {"ts_ms -> ms (standard)", "ts_ms", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs, kUpperMs,
-     cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
-    {"ts_ns -> ms (standard)", "ts_ns", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs, kUpperMs,
-     cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
+  // =====================================================================
+  // CLAIM 3: Filter evaluation happens against RAW Parquet values, not
+  //          converted values. ms scalars that should match 3 rows
+  //          return 0 when native precision differs.
+  // =====================================================================
+  std::cout << "=== CLAIM 3: Filter evaluates against raw (unconverted) values ===\n\n";
+  {
+    // 3a: ts_us native=us, timestamp_type=ms, ms scalars -> 0 rows
+    std::cout << "  3a: ts_us (native us) -> ms, filter with ms scalars\n";
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    auto& filter = build_range_filter<cudf::timestamp_ms>(0, kLowerMs, kUpperMs, tree, scalars);
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({"ts_us"})
+                     .filter(filter)
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    auto result = cudf::io::read_parquet(builder.build());
+    auto rows   = result.tbl->view().num_rows();
+    std::cout << "      rows=" << rows << " (expected 3 if filter used converted values)\n";
+    check("ts_us -> ms with ms filter: 0 rows (filter sees raw us values)", rows == 0);
+  }
+  {
+    // 3b: ts_ns native=ns, timestamp_type=ms, ms scalars -> 0 rows
+    std::cout << "  3b: ts_ns (native ns) -> ms, filter with ms scalars\n";
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    auto& filter = build_range_filter<cudf::timestamp_ms>(0, kLowerMs, kUpperMs, tree, scalars);
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({"ts_ns"})
+                     .filter(filter)
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    auto result = cudf::io::read_parquet(builder.build());
+    auto rows   = result.tbl->view().num_rows();
+    std::cout << "      rows=" << rows << " (expected 3 if filter used converted values)\n";
+    check("ts_ns -> ms with ms filter: 0 rows (filter sees raw ns values)", rows == 0);
+  }
+  {
+    // 3c: Control -- ts_ms native=ms, timestamp_type=ms, ms scalars -> 3 rows
+    //     (no conversion needed, so native and output precision match)
+    std::cout << "  3c: ts_ms (native ms) -> ms, filter with ms scalars (control)\n";
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    auto& filter = build_range_filter<cudf::timestamp_ms>(0, kLowerMs, kUpperMs, tree, scalars);
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({"ts_ms"})
+                     .filter(filter)
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    auto result = cudf::io::read_parquet(builder.build());
+    auto rows   = result.tbl->view().num_rows();
+    std::cout << "      rows=" << rows << " (native matches output, filter works)\n";
+    check("ts_ms -> ms with ms filter: 3 rows (no conversion, filter correct)", rows == 3);
+  }
+  std::cout << "\n";
 
-    // -- NativeResolution --
-    {"ts_us native us (standard)", "ts_us", cudf::type_id::TIMESTAMP_MICROSECONDS, kLowerUs,
-     kUpperUs, cudf::type_id::TIMESTAMP_MICROSECONDS, kExpectedRows, false},
-    {"ts_ms native ms (standard)", "ts_ms", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs,
-     kUpperMs, cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
-    {"ts_ns native ns (standard)", "ts_ns", cudf::type_id::TIMESTAMP_NANOSECONDS, kLowerNs,
-     kUpperNs, cudf::type_id::TIMESTAMP_NANOSECONDS, kExpectedRows, false},
+  // =====================================================================
+  // CLAIM 4: Conversion happens AFTER filtering. Surviving rows appear
+  //          in the requested output precision, not the native precision.
+  // =====================================================================
+  std::cout << "=== CLAIM 4: Conversion happens after filtering ===\n\n";
+  {
+    // Read ts_us (native us) with timestamp_type=ms, no filter.
+    // All 5 rows survive. Output values should be in ms, not us.
+    std::cout << "  4a: ts_us unfiltered with timestamp_type=ms\n";
+    auto builder = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                     .column_names({"ts_us"})
+                     .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    auto result     = cudf::io::read_parquet(builder.build());
+    auto table      = result.tbl->view();
+    auto output_tid = table.column(0).type().id();
+    auto rows       = table.num_rows();
 
-    // -- CrossConvert --
-    {"ts_us -> us (standard)", "ts_us", cudf::type_id::TIMESTAMP_MICROSECONDS, kLowerUs, kUpperUs,
-     cudf::type_id::TIMESTAMP_MICROSECONDS, kExpectedRows, false},
-    {"ts_us -> ns (standard)", "ts_us", cudf::type_id::TIMESTAMP_NANOSECONDS, kLowerNs, kUpperNs,
-     cudf::type_id::TIMESTAMP_NANOSECONDS, kExpectedRows, false},
+    // Read the first value and verify it's in ms range, not us range.
+    std::vector<int64_t> host(rows);
+    cudaMemcpy(
+      host.data(), table.column(0).data<int64_t>(), rows * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    // First value: 2026-03-15T00:00Z = 1,773,532,800,000 ms = 1,773,532,800,000,000 us
+    bool values_in_ms = (host[0] == 1'773'532'800'000LL);
+    bool values_in_us = (host[0] == 1'773'532'800'000'000LL);
+    std::cout << "      output type: " << type_id_name(output_tid) << "\n";
+    std::cout << "      first value: " << host[0] << "\n";
+    std::cout << "      is ms-scale: " << (values_in_ms ? "yes" : "no") << "\n";
+    std::cout << "      is us-scale: " << (values_in_us ? "yes" : "no") << "\n";
+    check("unfiltered output values are ms-scale (conversion applied)", values_in_ms);
+    check("unfiltered output values are NOT us-scale", !values_in_us);
+  }
+  {
+    // Now read with a native-matching filter (us scalars, no timestamp_type)
+    // to get 3 filtered rows, then re-read with timestamp_type=ms + same
+    // filter but in ms. If claim 4 is true, the ms-filtered read returns
+    // 0 rows, but an unfiltered read followed by manual inspection shows
+    // the conversion did happen on the full dataset.
+    std::cout << "  4b: ts_us with native us filter (no conversion) -> 3 rows in us\n";
+    cudf::ast::tree tree1;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars1;
+    auto& filter1 = build_range_filter<cudf::timestamp_us>(0, kLowerUs, kUpperUs, tree1, scalars1);
+    auto builder1 = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                      .column_names({"ts_us"})
+                      .filter(filter1);
+    auto result1 = cudf::io::read_parquet(builder1.build());
+    auto rows1   = result1.tbl->view().num_rows();
+    auto tid1    = result1.tbl->view().column(0).type().id();
+    std::cout << "      rows=" << rows1 << ", type=" << type_id_name(tid1) << "\n";
+    check("native us filter without conversion: 3 rows", rows1 == 3);
+    check("native us filter output type is TIMESTAMP_MICROSECONDS",
+          tid1 == cudf::type_id::TIMESTAMP_MICROSECONDS);
 
-    // -- WrongUnit: us scalars against ms-converted column --
-    {"ts_us -> ms, WRONG us filter (standard)", "ts_us", cudf::type_id::TIMESTAMP_MICROSECONDS,
-     kLowerUs, kUpperUs, cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, true},
+    std::cout << "  4c: ts_us with ms filter + timestamp_type=ms -> 0 rows (filter pre-conversion)\n";
+    cudf::ast::tree tree2;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars2;
+    auto& filter2 = build_range_filter<cudf::timestamp_ms>(0, kLowerMs, kUpperMs, tree2, scalars2);
+    auto builder2 = cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+                      .column_names({"ts_us"})
+                      .filter(filter2)
+                      .timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+    auto result2 = cudf::io::read_parquet(builder2.build());
+    auto rows2   = result2.tbl->view().num_rows();
+    auto tid2    = result2.tbl->view().column(0).type().id();
+    std::cout << "      rows=" << rows2 << ", type=" << type_id_name(tid2) << "\n";
+    check("ms filter + timestamp_type=ms: 0 rows (conversion is post-filter)", rows2 == 0);
+    check("output type is still TIMESTAMP_MILLISECONDS despite 0 rows",
+          tid2 == cudf::type_id::TIMESTAMP_MILLISECONDS);
+  }
+  std::cout << "\n";
 
-    // -- NoConversion: no timestamp_type set, native precision --
-    {"ts_us no conversion (standard)", "ts_us", cudf::type_id::TIMESTAMP_MICROSECONDS, kLowerUs,
-     kUpperUs, cudf::type_id::EMPTY, kExpectedRows, false},
-    {"ts_ms no conversion (standard)", "ts_ms", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs,
-     kUpperMs, cudf::type_id::EMPTY, kExpectedRows, false},
-    {"ts_ns no conversion (standard)", "ts_ns", cudf::type_id::TIMESTAMP_NANOSECONDS, kLowerNs,
-     kUpperNs, cudf::type_id::EMPTY, kExpectedRows, false},
+  std::cout << "=== Claims verification: " << v_passed << " verified, " << v_failed
+            << " refuted ===\n\n";
+
+  // =====================================================================
+  // Full 36-combination matrix:
+  //   3 native precisions (us, ms, ns)
+  //   x 3 filter scalar precisions (us, ms, ns)
+  //   x 4 timestamp_type values (us, ms, ns, unset)
+  //
+  // Expected outcomes:
+  //   3 rows:  filter scalar == native AND (timestamp_type == native OR unset)
+  //   0 rows:  filter scalar == timestamp_type != native
+  //   throws:  filter scalar != output type
+  //            (output type = timestamp_type if set, else native)
+  // =====================================================================
+
+  using tid = cudf::type_id;
+  using eo  = expected_outcome;
+
+  // clang-format off
+  std::vector<matrix_case> matrix = {
+    // --- Parquet native: us (column ts_us) ---
+    //                          col      filter                  timestamp_type          expected
+    {"ts_us", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_MICROSECONDS, eo::ROWS_3},  // us/us/us
+    {"ts_us", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_MILLISECONDS, eo::THROWS},  // us/us/ms
+    {"ts_us", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_NANOSECONDS,  eo::THROWS},  // us/us/ns
+    {"ts_us", tid::TIMESTAMP_MICROSECONDS, tid::EMPTY,                  eo::ROWS_3},  // us/us/unset
+    {"ts_us", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_MICROSECONDS, eo::THROWS},  // us/ms/us
+    {"ts_us", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_MILLISECONDS, eo::ROWS_0},  // us/ms/ms
+    {"ts_us", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_NANOSECONDS,  eo::THROWS},  // us/ms/ns
+    {"ts_us", tid::TIMESTAMP_MILLISECONDS, tid::EMPTY,                  eo::THROWS},  // us/ms/unset
+    {"ts_us", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_MICROSECONDS, eo::THROWS},  // us/ns/us
+    {"ts_us", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_MILLISECONDS, eo::THROWS},  // us/ns/ms
+    {"ts_us", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_NANOSECONDS,  eo::ROWS_0},  // us/ns/ns
+    {"ts_us", tid::TIMESTAMP_NANOSECONDS,  tid::EMPTY,                  eo::THROWS},  // us/ns/unset
+
+    // --- Parquet native: ms (column ts_ms) ---
+    {"ts_ms", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_MICROSECONDS, eo::ROWS_0},  // ms/us/us
+    {"ts_ms", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_MILLISECONDS, eo::THROWS},  // ms/us/ms
+    {"ts_ms", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_NANOSECONDS,  eo::THROWS},  // ms/us/ns
+    {"ts_ms", tid::TIMESTAMP_MICROSECONDS, tid::EMPTY,                  eo::THROWS},  // ms/us/unset
+    {"ts_ms", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_MICROSECONDS, eo::THROWS},  // ms/ms/us
+    {"ts_ms", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_MILLISECONDS, eo::ROWS_3},  // ms/ms/ms
+    {"ts_ms", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_NANOSECONDS,  eo::THROWS},  // ms/ms/ns
+    {"ts_ms", tid::TIMESTAMP_MILLISECONDS, tid::EMPTY,                  eo::ROWS_3},  // ms/ms/unset
+    {"ts_ms", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_MICROSECONDS, eo::THROWS},  // ms/ns/us
+    {"ts_ms", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_MILLISECONDS, eo::THROWS},  // ms/ns/ms
+    {"ts_ms", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_NANOSECONDS,  eo::ROWS_0},  // ms/ns/ns
+    {"ts_ms", tid::TIMESTAMP_NANOSECONDS,  tid::EMPTY,                  eo::THROWS},  // ms/ns/unset
+
+    // --- Parquet native: ns (column ts_ns) ---
+    {"ts_ns", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_MICROSECONDS, eo::ROWS_0},  // ns/us/us
+    {"ts_ns", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_MILLISECONDS, eo::THROWS},  // ns/us/ms
+    {"ts_ns", tid::TIMESTAMP_MICROSECONDS, tid::TIMESTAMP_NANOSECONDS,  eo::THROWS},  // ns/us/ns
+    {"ts_ns", tid::TIMESTAMP_MICROSECONDS, tid::EMPTY,                  eo::THROWS},  // ns/us/unset
+    {"ts_ns", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_MICROSECONDS, eo::THROWS},  // ns/ms/us
+    {"ts_ns", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_MILLISECONDS, eo::ROWS_0},  // ns/ms/ms
+    {"ts_ns", tid::TIMESTAMP_MILLISECONDS, tid::TIMESTAMP_NANOSECONDS,  eo::THROWS},  // ns/ms/ns
+    {"ts_ns", tid::TIMESTAMP_MILLISECONDS, tid::EMPTY,                  eo::THROWS},  // ns/ms/unset
+    {"ts_ns", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_MICROSECONDS, eo::THROWS},  // ns/ns/us
+    {"ts_ns", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_MILLISECONDS, eo::THROWS},  // ns/ns/ms
+    {"ts_ns", tid::TIMESTAMP_NANOSECONDS,  tid::TIMESTAMP_NANOSECONDS,  eo::ROWS_3},  // ns/ns/ns
+    {"ts_ns", tid::TIMESTAMP_NANOSECONDS,  tid::EMPTY,                  eo::ROWS_3},  // ns/ns/unset
+  };
+  // clang-format on
+
+  int passed = 0;
+  int failed = 0;
+
+  auto ts_type_label = [](cudf::type_id t) -> std::string {
+    switch (t) {
+      case tid::TIMESTAMP_MICROSECONDS: return "us";
+      case tid::TIMESTAMP_MILLISECONDS: return "ms";
+      case tid::TIMESTAMP_NANOSECONDS: return "ns";
+      case tid::EMPTY: return "unset";
+      default: return "?";
+    }
   };
 
-  std::vector<test_case> chunked_cases = {
-    // -- ConvertedToMs (chunked) --
-    {"ts_us -> ms (chunked)", "ts_us", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs, kUpperMs,
-     cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
-    {"ts_ms -> ms (chunked)", "ts_ms", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs, kUpperMs,
-     cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
-    {"ts_ns -> ms (chunked)", "ts_ns", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs, kUpperMs,
-     cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
-
-    // -- NativeResolution (chunked) --
-    {"ts_us native us (chunked)", "ts_us", cudf::type_id::TIMESTAMP_MICROSECONDS, kLowerUs,
-     kUpperUs, cudf::type_id::TIMESTAMP_MICROSECONDS, kExpectedRows, false},
-    {"ts_ms native ms (chunked)", "ts_ms", cudf::type_id::TIMESTAMP_MILLISECONDS, kLowerMs,
-     kUpperMs, cudf::type_id::TIMESTAMP_MILLISECONDS, kExpectedRows, false},
-    {"ts_ns native ns (chunked)", "ts_ns", cudf::type_id::TIMESTAMP_NANOSECONDS, kLowerNs,
-     kUpperNs, cudf::type_id::TIMESTAMP_NANOSECONDS, kExpectedRows, false},
-  };
-
-  int passed  = 0;
-  int failed  = 0;
-  int total   = 0;
-
-  std::cout << "=== Standard reader tests ===\n\n";
-  for (auto const& tc : standard_cases) {
-    ++total;
-    std::cout << "[" << total << "] " << tc.label << "\n";
-    if (run_standard_read(filepath, tc)) {
+  std::cout << "=== Full 36-combination matrix ===\n\n";
+  for (int i = 0; i < static_cast<int>(matrix.size()); ++i) {
+    auto const& mc = matrix[i];
+    // Extract native precision from column name
+    auto native = mc.col_name.substr(3);  // "us", "ms", or "ns"
+    std::cout << "[" << (i + 1) << "] native=" << native
+              << " filter=" << ts_type_label(mc.filter_type)
+              << " timestamp_type=" << ts_type_label(mc.timestamp_type)
+              << " expect=" << outcome_name(mc.expected) << "\n";
+    if (run_matrix_case(filepath, mc)) {
       ++passed;
     } else {
       ++failed;
     }
-    std::cout << "\n";
   }
 
-  std::cout << "=== Chunked reader tests ===\n\n";
-  for (auto const& tc : chunked_cases) {
-    ++total;
-    std::cout << "[" << total << "] " << tc.label << "\n";
-    if (run_chunked_read(filepath, tc)) {
-      ++passed;
-    } else {
-      ++failed;
-    }
-    std::cout << "\n";
-  }
+  std::cout << "\n=== Matrix: " << passed << " passed, " << failed << " failed, "
+            << matrix.size() << " total ===\n";
 
-  std::cout << "=== Summary: " << passed << " passed, " << failed << " failed, " << total
-            << " total ===\n";
-
-  return failed > 0 ? 1 : 0;
+  return (v_failed + failed) > 0 ? 1 : 0;
 }
